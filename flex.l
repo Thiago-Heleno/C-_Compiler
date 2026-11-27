@@ -64,11 +64,11 @@ int linha = 1;
 
     /* Operadores */
 
-<= {
+"<=" {
     return T_LE;
 }
 
-< {
+"<" {
     return T_LT;
 }
 

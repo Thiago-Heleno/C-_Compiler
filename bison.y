@@ -16,6 +16,123 @@ void yyerror(const char *s);
 Simbolo *tabela = NULL;
 char escopo_atual[128] = "global";
 Tipo tipo_funcao_atual = TIPO_VOID;
+
+typedef enum {
+    AST_NUMERO,
+    AST_OPERADOR,
+    AST_CHAMADA,
+    AST_EXPRESSAO_PENDENTE
+} TipoNoAST;
+
+struct NoAST {
+    TipoNoAST tipo;
+    const char *operador;
+    int numero;
+    NoAST *esquerda;
+    NoAST *direita;
+    char *nome_funcao;
+    NoAST *argumentos;
+    NoAST *proximo_argumento;
+    NoAST *proximo_alocado;
+};
+
+/* A lista guarda os nos ate o fim da analise, inclusive em caso de erro. */
+static NoAST *nos_alocados = NULL;
+
+static NoAST *novo_no(TipoNoAST tipo)
+{
+    NoAST *no = malloc(sizeof *no);
+    if (no == NULL) {
+        fprintf(stderr, "Erro ao alocar memoria para a AST.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    *no = (NoAST){.tipo = tipo, .proximo_alocado = nos_alocados};
+    nos_alocados = no;
+    return no;
+}
+
+static NoAST *novo_no_binario(const char *operador, NoAST *esquerda, NoAST *direita)
+{
+    if (esquerda == NULL || direita == NULL) {
+        return NULL;
+    }
+    NoAST *no = novo_no(AST_OPERADOR);
+    no->operador = operador;
+    no->esquerda = esquerda;
+    no->direita = direita;
+    return no;
+}
+
+static ListaAST anexa_argumento(ListaAST lista, Valor valor)
+{
+    if (valor.tipo == TIPO_ERRO) {
+        lista.tem_erro = 1;
+        return lista;
+    }
+
+    NoAST *expressao = valor.ast;
+    if (expressao == NULL) {
+        /* shortcut: preserva a posicao ate a expressao ganhar um no proprio. */
+        expressao = novo_no(AST_EXPRESSAO_PENDENTE);
+    }
+    if (lista.ultimo == NULL) {
+        lista.primeiro = expressao;
+    } else {
+        lista.ultimo->proximo_argumento = expressao;
+    }
+    lista.ultimo = expressao;
+    return lista;
+}
+
+static NoAST *novo_no_chamada(const char *nome, NoAST *argumentos)
+{
+    NoAST *no = novo_no(AST_CHAMADA);
+    no->nome_funcao = strdup(nome);
+    if (no->nome_funcao == NULL) {
+        fprintf(stderr, "Erro ao copiar o nome da funcao para a AST.\n");
+        exit(EXIT_FAILURE);
+    }
+    no->argumentos = argumentos;
+    return no;
+}
+
+static void imprime_ast(const NoAST *no, int indentacao)
+{
+    if (no == NULL) {
+        return;
+    }
+
+    switch (no->tipo) {
+    case AST_NUMERO:
+        printf("%*s%d\n", indentacao, "", no->numero);
+        break;
+    case AST_OPERADOR:
+        printf("%*s%s\n", indentacao, "", no->operador);
+        imprime_ast(no->esquerda, indentacao + 2);
+        imprime_ast(no->direita, indentacao + 2);
+        break;
+    case AST_CHAMADA:
+        printf("%*schamada %s\n", indentacao, "", no->nome_funcao);
+        for (const NoAST *arg = no->argumentos; arg != NULL; arg = arg->proximo_argumento) {
+            imprime_ast(arg, indentacao + 2);
+        }
+        break;
+    case AST_EXPRESSAO_PENDENTE:
+        printf("%*s<expressao ainda sem AST>\n", indentacao, "");
+        break;
+    }
+}
+
+static void libera_ast(void)
+{
+    while (nos_alocados != NULL) {
+        NoAST *no = nos_alocados;
+        nos_alocados = no->proximo_alocado;
+        free(no->nome_funcao);
+        free(no);
+    }
+}
 %}
 
 
@@ -28,6 +145,7 @@ Tipo tipo_funcao_atual = TIPO_VOID;
     char *id;
     Tipo tipo;
     Valor val;
+    ListaAST lista;
     const char *op;
 }
 
@@ -51,6 +169,7 @@ Tipo tipo_funcao_atual = TIPO_VOID;
 
 %type<tipo> tipo_especificador
 %type<val> expressao simples_expressao soma_expressao termo fator var ativacao
+%type<lista> args arg_lista
 %type<op> relacional
 
 /* Resolucao do conflito dangling-else */
@@ -173,6 +292,13 @@ Tipo tipo_funcao_atual = TIPO_VOID;
 
     expressao_decl
     : expressao T_SEMI
+        {
+            /* shortcut: imprime arvores de expressoes isoladas ate existir uma raiz de programa. */
+            if ($1.ast != NULL) {
+                puts("\n---- AST DA EXPRESSAO ----");
+                imprime_ast($1.ast, 0);
+            }
+        }
     | T_SEMI
     ;
 
@@ -252,13 +378,25 @@ Tipo tipo_funcao_atual = TIPO_VOID;
     ;
 
     soma_expressao
-    : soma_expressao T_MAIS termo { $$ = op_soma($1, $3); }
+    : soma_expressao T_MAIS termo
+        {
+            $$ = op_soma($1, $3);
+            if ($$.tipo == TIPO_INT) {
+                $$.ast = novo_no_binario("+", $1.ast, $3.ast);
+            }
+        }
     | soma_expressao T_MENOS termo { $$ = op_sub($1, $3); }
     | termo { $$ = $1; }
     ;
 
     termo
-    : termo T_MULT fator { $$ = op_mult($1, $3); }
+    : termo T_MULT fator
+        {
+            $$ = op_mult($1, $3);
+            if ($$.tipo == TIPO_INT) {
+                $$.ast = novo_no_binario("*", $1.ast, $3.ast);
+            }
+        }
     | termo T_DIV fator { $$ = op_div($1, $3); }
     | fator { $$ = $1; }
     ;
@@ -278,27 +416,35 @@ Tipo tipo_funcao_atual = TIPO_VOID;
     }
     | T_INT
         {
-    $$ = make_inteiro($1, linha);
-    }
+            $$ = make_inteiro($1, linha);
+            $$.ast = novo_no(AST_NUMERO);
+            $$.ast->numero = $1;
+        }
     ;
 
     ativacao
     : T_ID T_LPAR args T_RPAR
         {
-    Simbolo *s = busca_simbolo_visivel(tabela, $1, escopo_atual);
-    $$ = verifica_chamada(s, $1, linha);
-    free($1);
-    }
+            Simbolo *s = busca_simbolo_visivel(tabela, $1, escopo_atual);
+            $$ = verifica_chamada(s, $1, linha);
+            if ($3.tem_erro) {
+                $$ = make_tipo(TIPO_ERRO, linha);
+            }
+            if ($$.tipo != TIPO_ERRO) {
+                $$.ast = novo_no_chamada($1, $3.primeiro);
+            }
+            free($1);
+        }
     ;
 
     args
-    : arg_lista
-    | /* vazio */
+    : arg_lista   { $$ = $1; }
+    | /* vazio */ { $$ = (ListaAST){0}; }
     ;
 
     arg_lista
-    : arg_lista T_COMMA expressao
-    | expressao
+    : arg_lista T_COMMA expressao { $$ = anexa_argumento($1, $3); }
+    | expressao                   { $$ = anexa_argumento((ListaAST){0}, $1); }
     ;
 
 %%
@@ -329,6 +475,7 @@ int main(int argc, char **argv){
     }
 
     imprime_lista(tabela);
+    libera_ast();
     libera_lista(tabela);
     fclose(yyin);
 
