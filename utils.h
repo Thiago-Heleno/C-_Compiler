@@ -14,11 +14,20 @@ typedef enum {
     TIPO_ERRO
 } Tipo;
 
+typedef struct NoAST NoAST;
+
+typedef struct {
+    NoAST *primeiro;
+    NoAST *ultimo;
+    int tem_erro;
+} ListaAST;
+
 typedef struct {
     Tipo tipo;
     int ival;
     int eh_const;
     int linha;
+    NoAST *ast;
 } Valor;
 
 /* ---- TABELA DE SIMBOLOS (LISTA ENCADEADA COM CABECA) ---- */
@@ -164,6 +173,7 @@ static inline Valor make_inteiro(int x, int linha) {
     v.ival = x;
     v.eh_const = 1;
     v.linha = linha;
+    v.ast = NULL;
     return v;
 }
 
@@ -173,6 +183,7 @@ static inline Valor make_tipo(Tipo tipo, int linha) {
     v.ival = 0;
     v.eh_const = 0;
     v.linha = linha;
+    v.ast = NULL;
     return v;
 }
 
